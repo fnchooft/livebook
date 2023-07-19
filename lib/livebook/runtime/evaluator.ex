@@ -434,10 +434,17 @@ defmodule Livebook.Runtime.Evaluator do
     end
 
     start_time = System.monotonic_time()
+
     {eval_result, code_markers} = eval(language, code, context.binding, context.env)
+
+    # IO.inspect("Evaluated: #{language}-cell")
+
     evaluation_time_ms = time_diff_ms(start_time)
 
     %{tracer_info: tracer_info} = Evaluator.IOProxy.after_evaluation(state.io_proxy)
+
+    # Result from eval - at least for erlang (module,statements) looks like this:alarm_handler
+    # {{:ok, result, binding, env}, []}
 
     {new_context, result, identifiers_used, identifiers_defined, identifier_definitions} =
       case eval_result do
@@ -689,6 +696,153 @@ defmodule Livebook.Runtime.Evaluator do
   end
 
   defp eval(:erlang, code, binding, env) do
+    case :erl_scan.string(String.to_charlist(code)) do
+      {:ok, tokens, _} ->
+        case find_first_module_attribute(tokens) do
+          {:ok, _module_name} ->
+            eval_module(:erlang, code, binding, env)
+
+          :error ->
+            eval_statements(:erlang, code, binding, env)
+        end
+    end
+  end
+
+  # ------------------------------------------------------------------------
+  # Simple Erlang Module - helper functions
+  # ------------------------------------------------------------------------
+  # Start of an attribute
+  defp is_not_module_declaration({:-, _}), do: false
+  # Ignore comments
+  defp is_not_module_declaration({_, _, :comment, _}), do: true
+  # Ignore everything else
+  defp is_not_module_declaration(_), do: true
+
+  # Find the first valid module declaration in a token list
+  defp find_first_module_attribute(tokens) do
+    case :lists.dropwhile(&is_not_module_declaration/1, tokens) do
+      # Multiple declarations of a module could be defined, that's fine, we need at least one to run in module mode
+      [
+        {:-, _},
+        {:atom, _, :module},
+        {:"(", _},
+        {:atom, _, module_name},
+        {:")", _},
+        {:dot, _}
+        | _
+      ] ->
+        {:ok, module_name}
+
+      _ ->
+        # No -module(module_name). attribute
+        :error
+    end
+  end
+
+  # In order to handle the expression in their forms - separate per {:dot,_}
+  defp not_dot({:dot, _}) do
+    false
+  end
+
+  defp not_dot(_) do
+    true
+  end
+
+  # A list of scanned token - must be separated per dot, in order to feed them
+  # into the :erl_parse.parse_form function.
+  defp tokens_to_forms(tokens) do
+    {:ok, tokens_to_forms(tokens, [])}
+  end
+
+  defp tokens_to_forms([], acc) do
+    :lists.reverse(acc)
+  end
+
+  defp tokens_to_forms(tokens, acc) do
+    form = :lists.takewhile(&not_dot/1, tokens)
+    [dot | rest] = :lists.dropwhile(&not_dot/1, tokens)
+    tokens_to_forms(rest, [{form ++ [dot]}] ++ acc)
+  end
+
+  defp parse_forms(form_statements) do
+    try do
+      res =
+        Enum.map(
+          form_statements,
+          fn {form_statement} ->
+            case :erl_parse.parse_form(form_statement) do
+              {:ok, form} -> form
+              err -> throw({:parse_fail, err})
+            end
+          end
+        )
+
+      {:ok, res}
+    catch
+      {:parse_fail, err} -> err
+    end
+  end
+
+  # Create module - tokens from string
+  # Based on: https://stackoverflow.com/questions/2160660/how-to-compile-erlang-code-loaded-into-a-string
+  # The function will first assume that code starting with -module( is a erlang module definition
+
+  # Step 1: Scan the code
+  # Step 2: Convert to forms
+  # Step 3: Extract module name
+  # Step 4: Compile and load
+  # Step 5: If compile success - calculate md5 and register module
+
+  defp eval_module(:erlang, code, binding, env) do
+    try do
+      with {:ok, tokens, _} <- :erl_scan.string(String.to_charlist(code), {1, 1}, [:text]),
+           {:ok, form_statements} <- tokens_to_forms(tokens),
+           {:ok, forms} <- parse_forms(form_statements) do
+        # First statement - form = module definition
+        {:attribute, _, :module, module_name} = hd(forms)
+
+        # Compile the forms from the code-block
+        {:ok, _, binary_module} = :compile.forms(forms)
+        {:module, new_module} = :code.load_binary(module_name, ~c"nofile", binary_module)
+
+
+
+        # Registration of module
+        version = apply(new_module, :module_info, [:md5])
+        # Add the newly defined erlang module
+        env = Map.put(env, :identifiers_used , {:module, new_module})
+        env = Map.put(env, :identifiers_defined, {{:module, new_module}, version})
+
+        #IO.inspect("Forms:")
+        #IO.inspect(forms, limit: :infinity)
+        #IO.inspect(env, limit: :infinity)
+
+        # We can only interact with an erlang module if the functions are exported.
+        #exported_functions =
+        #  for {:attribute, [text: ~c"export", location: l], :export, mfas} <- forms, into: [], uniq: true, do:
+        #    mfas |> Enum.map(fn {f,c} -> %{module: module_name , function: f, arg_cnt: c, location: l} end)
+        #exported_functions = exported_functions |> List.flatten()
+        #IO.inspect(exported_functions)
+
+
+        {{:ok, ~c"erlang module [#{module_name}] successfully compiled", binding, env}, []}
+      else
+        # Tokenizer error - https://www.erlang.org/doc/man/erl_scan.html#string-3
+        {:error, {location, module, description}, _end_loc} ->
+          process_erlang_error(env, code, location, module, description)
+
+        # Parser error - https://www.erlang.org/doc/man/erl_parse.html#parse_form-1
+        {:error, {location, module, description}} ->
+          process_erlang_error(env, code, location, module, description)
+      end
+    catch
+      kind, error ->
+        stacktrace = prune_stacktrace(:erl_eval, __STACKTRACE__)
+        {{:error, kind, error, stacktrace}, []}
+    end
+  end
+
+  defp eval_statements(:erlang, code, binding, env) do
     try do
       erl_binding =
         Enum.reduce(binding, %{}, fn {name, value}, erl_binding ->
@@ -702,9 +856,17 @@ defmodule Livebook.Runtime.Evaluator do
         # the tokens and assume all var tokens are used variables.
         # This will not handle shadowing of variables in fun definitions
         # and will only work well enough for expressions, not for modules.
+
         used_vars =
           for {:var, _anno, name} <- tokens,
               do: {erlang_to_elixir_var(name), nil},
+              into: MapSet.new(),
+              uniq: true
+
+        called_functions =
+          for {:call, _, {:remote, _, {:atom, _, call_module}, {:atom, _, call_function}}, _} <-
+                parsed,
+              do: {{erlang_to_elixir_var(call_module), erlang_to_elixir_var(call_function)}, nil},
               into: MapSet.new(),
               uniq: true
 

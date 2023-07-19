@@ -1300,6 +1300,72 @@ defmodule Livebook.Runtime.EvaluatorTest do
       assert_receive {:runtime_evaluation_response, :code_1, terminal_text("6"), metadata()}
     end
 
+    test "evaluate erlang-module code", %{evaluator: evaluator} do
+      Evaluator.evaluate_code(
+        evaluator,
+        :erlang,
+        "-module(tryme). -export([go/0]). go() ->{ok,went}.",
+        :code_4,
+        []
+      )
+
+      assert_receive {:runtime_evaluation_response, :code_4, terminal_text(_), metadata()}
+    end
+
+    test "evaluate erlang-module error function already defined", %{evaluator: evaluator} do
+      Evaluator.evaluate_code(
+        evaluator,
+        :erlang,
+        "-module(tryme). -export([go/0]). go() ->{ok,went}. go() ->{ok,went}.",
+        :code_4,
+        []
+      )
+
+      assert_receive {:runtime_evaluation_output, :code_4,
+                      %{
+                        chunk: true,
+                        text: ":1:52: function go/0 already defined\n",
+                        type: :terminal_text
+                      }}
+    end
+
+    test "evaluate erlang-module error - expression after module", %{evaluator: evaluator} do
+      Evaluator.evaluate_code(
+        evaluator,
+        :erlang,
+        "-module(tryme). -export([go/0]). go() ->{ok,went}. go() ->{ok,went}. A = 1.",
+        :code_4,
+        []
+      )
+
+      assert_receive {
+        :runtime_evaluation_response,
+        :code_4,
+        error(_), metadata()
+      }
+    end
+
+    test "evaluate erlang-module error - two modules", %{evaluator: evaluator} do
+      Evaluator.evaluate_code(
+        evaluator,
+        :erlang,
+        "-module(one). -export([go/0]). go() ->{ok,one}. -module(two). -export([go/0]). go() ->{ok,two}.",
+        :code_4,
+        []
+      )
+
+      assert_receive {
+        :runtime_evaluation_output,
+        :code_4,
+        %{
+          chunk: true,
+          text:
+            ":1:50: attribute module after function definitions\n:1:64: attribute export after function definitions\n:1:80: function go/0 already defined\n",
+          type: :terminal_text
+        }
+      }
+    end
+
     test "mixed erlang/elixir bindings", %{evaluator: evaluator} do
       Evaluator.evaluate_code(evaluator, :elixir, "x = 1", :code_1, [])
       Evaluator.evaluate_code(evaluator, :erlang, "Y = X.", :code_2, [:code_1])

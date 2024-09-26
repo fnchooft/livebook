@@ -690,16 +690,44 @@ defmodule Livebook.Runtime.Evaluator do
 
   # main entry point to decide between erlang-statements vs module
   defp eval(:erlang, code, binding, env) do
-    is_module = String.starts_with?(code, "-module(")
-
-    case is_module do
-      true -> eval_module(:erlang, code, binding, env)
-      false -> eval_statements(:erlang, code, binding, env)
+    case :erl_scan.string(String.to_charlist(code)) do
+      {:ok, tokens, _} ->
+        case find_first_module_attribute(tokens) do
+          {:ok, _module_name} ->
+            eval_module(:erlang, code, binding, env)
+          :error ->
+            eval_statements(:erlang, code, binding, env)
+        end
     end
   end
 
   # Simple Erlang Module - helper functions
   # ------------------------------------------------------------------------
+  # Helper function to filter out comments and non-relevant tokens
+  defp is_not_module_declaration({:-, _}), do: false  # Start of an attribute
+  defp is_not_module_declaration({_, _, :comment, _}), do: true  # Ignore comments
+  defp is_not_module_declaration(_), do: true  # Ignore everything else
+
+  # Find the first valid module declaration in a token list
+  defp find_first_module_attribute(tokens) do
+    case :lists.dropwhile(&is_not_module_declaration/1, tokens) do
+      # Multiple declarations of a module could be defined, that's fine, we need at least one to run in module mode
+      [
+        {:-, _},
+        {:atom, _, :module},
+        {:"(", _},
+        {:atom, _, module_name},
+        {:")", _},
+        {:dot, _}
+        | _
+      ] ->
+        {:ok, module_name}
+      _ ->
+        # No -module(module_name). attribute
+        :error
+    end
+  end
+
   # In order to handle the expression in their forms - separate per {:dot,_}
   defp not_dot({:dot, _}) do
     false
@@ -709,7 +737,7 @@ defmodule Livebook.Runtime.Evaluator do
     true
   end
 
-  # A list of scanned token - must be seperated per dot, in order to feed them
+  # A list of scanned token - must be separated per dot, in order to feed them
   # into the :erl_parse.parse_form function.
   defp tokens_to_forms(tokens) do
     {:ok, tokens_to_forms(tokens, [])}

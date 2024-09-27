@@ -863,7 +863,7 @@ defmodule Livebook.Runtime.Evaluator do
               into: MapSet.new(),
               uniq: true
 
-        called_functions =
+        _called_functions =
           for {:call, _, {:remote, _, {:atom, _, call_module}, {:atom, _, call_function}}, _} <-
                 parsed,
               do: {{erlang_to_elixir_var(call_module), erlang_to_elixir_var(call_function)}, nil},

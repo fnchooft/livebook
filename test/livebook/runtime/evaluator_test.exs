@@ -1322,11 +1322,8 @@ defmodule Livebook.Runtime.EvaluatorTest do
       )
 
       assert_receive {:runtime_evaluation_output, :code_4,
-                      %{
-                        chunk: true,
-                        text: ":1:52: function go/0 already defined\n",
-                        type: :terminal_text
-                      }}
+                      terminal_text(":1:52: function go/0 already defined\n", true),
+                     }
     end
 
     test "evaluate erlang-module error - expression after module", %{evaluator: evaluator} do
@@ -1357,12 +1354,7 @@ defmodule Livebook.Runtime.EvaluatorTest do
       assert_receive {
         :runtime_evaluation_output,
         :code_4,
-        %{
-          chunk: true,
-          text:
-            ":1:50: attribute module after function definitions\n:1:64: attribute export after function definitions\n:1:80: function go/0 already defined\n",
-          type: :terminal_text
-        }
+        terminal_text(":1:50: attribute module after function definitions\n:1:64: attribute export after function definitions\n:1:80: function go/0 already defined\n", true)
       }
     end
 
